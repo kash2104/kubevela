@@ -40,6 +40,7 @@ import (
 	wfTypesv1alpha1 "github.com/kubevela/pkg/apis/oam/v1alpha1"
 	monitorContext "github.com/kubevela/pkg/monitor/context"
 	workflowv1alpha1 "github.com/kubevela/workflow/api/v1alpha1"
+	"github.com/kubevela/workflow/pkg/executor"
 	wfTypes "github.com/kubevela/workflow/pkg/types"
 
 	"github.com/oam-dev/kubevela/apis/core.oam.dev/common"
@@ -107,6 +108,7 @@ var _ = Describe("Test Workflow", func() {
 		setupFooCRD(ctx)
 		setupNamespace(ctx, namespace)
 		setupTestDefinitions(ctx, testDefinitions, namespace)
+		executor.InitStepStatusCache(context.Background())
 		By("[TEST] Set up definitions before integration test")
 	})
 
