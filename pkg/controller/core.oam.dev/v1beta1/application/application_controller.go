@@ -581,7 +581,7 @@ func (r *Reconciler) writeStatusByMethod(ctx context.Context, method method, app
 		panic("unknown method")
 	}
 	if err := f(); err != nil {
-		executor.StepStatusCache.Put(fmt.Sprintf("%s-%s", app.Name, app.Namespace), -1, time.Minute * 5)
+		executor.StepStatusCache.Put(fmt.Sprintf("%s-%s", app.Name, app.Namespace), -1, time.Minute*5)
 		return err
 	}
 	if feature.DefaultMutableFeatureGate.Enabled(features.EnableApplicationStatusMetrics) {
