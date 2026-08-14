@@ -75,9 +75,18 @@ func DefaultCacheTTLConfig() *CacheTTLConfig {
 	}
 }
 
+// evictionReasonLabel normalizes the cache eviction reason into a stable,
+// lowercase Prometheus label value.
+func evictionReasonLabel(reason cache.EvictionReason) string {
+	if reason == cache.EvictTTL {
+		return "ttl"
+	}
+	return "capacity"
+}
+
 // Provider is the Helm chart provider
 type Provider struct {
-	cache               cache.Cache[string]
+	cache               cache.LRUCache[string, []byte]
 	helmClient          *cli.EnvSettings
 	cacheTTL            *CacheTTLConfig
 	releaseMu           sync.Mutex        // serializes install/upgrade/uninstall calls
@@ -107,8 +116,22 @@ var (
 // NewProvider creates a new Helm provider (returns singleton)
 func NewProvider() *Provider {
 	providerOnce.Do(func() {
+		lruCache, _ := cache.NewLRUStore[string, []byte](context.Background(), cache.Options[string, []byte]{
+			MaxSize:  0,
+			MaxBytes: 256 << 20, // 256 MB
+			SizeOf: func(key string, value []byte) int64 {
+				return int64(len(value))
+			},
+
+			SweepInterval: time.Second * 3,
+		})
+		lruCache.OnEvict = func(key string, value []byte, reason cache.EvictionReason) {
+			HelmChartCacheEvictionsTotal.WithLabelValues(evictionReasonLabel(reason)).Inc()
+			HelmChartCacheBytes.Set(float64(lruCache.CurrentBytes()))
+		}
 		globalProvider = &Provider{
-			cache:               cache.NewMemoryCacheStore[string](context.Background()),
+
+			cache:               lruCache,
 			helmClient:          cli.New(),
 			cacheTTL:            DefaultCacheTTLConfig(),
 			releaseFingerprints: make(map[string]string),
@@ -126,8 +149,20 @@ func NewProviderWithConfig(ttlConfig *CacheTTLConfig) *Provider {
 	if ttlConfig == nil {
 		ttlConfig = DefaultCacheTTLConfig()
 	}
+	lruCache, _ := cache.NewLRUStore[string, []byte](context.Background(), cache.Options[string, []byte]{
+		MaxSize:  0,
+		MaxBytes: 256 << 20, // 256 MB
+		SizeOf: func(key string, value []byte) int64 {
+			return int64(len(value))
+		},
+		SweepInterval: time.Second * 3,
+	})
+	lruCache.OnEvict = func(key string, value []byte, reason cache.EvictionReason) {
+		HelmChartCacheEvictionsTotal.WithLabelValues(evictionReasonLabel(reason)).Inc()
+		HelmChartCacheBytes.Set(float64(lruCache.CurrentBytes()))
+	}
 	p := &Provider{
-		cache:               cache.NewMemoryCacheStore[string](context.Background()),
+		cache:               lruCache,
 		helmClient:          cli.New(),
 		cacheTTL:            ttlConfig,
 		releaseFingerprints: make(map[string]string),

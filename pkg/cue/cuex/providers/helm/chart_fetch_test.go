@@ -29,6 +29,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	"helm.sh/helm/v3/pkg/chart"
+	"helm.sh/helm/v3/pkg/chart/loader"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -180,12 +181,9 @@ var _ = Describe("chart_fetch", func() {
 		})
 
 		It("should return a cached chart on cache hit", func() {
-			testChart := &chart.Chart{
-				Metadata: &chart.Metadata{Name: "cached-chart", Version: "1.0.0"},
-			}
 			// Pre-seed the cache with the expected key format: <sourceType>/<source>/<version>
 			cacheKey := "repo/nginx/1.0.0"
-			p.cache.Put(cacheKey, testChart, 1*time.Hour)
+			p.cache.Put(cacheKey, createMinimalChartArchive("cached-chart", "1.0.0"), 1*time.Hour)
 
 			result, err := p.fetchChart(context.Background(),
 				&ChartSourceParams{Source: "nginx", Version: "1.0.0"},
@@ -195,12 +193,9 @@ var _ = Describe("chart_fetch", func() {
 		})
 
 		It("should return a cached chart with custom cache key prefix", func() {
-			testChart := &chart.Chart{
-				Metadata: &chart.Metadata{Name: "custom-cached", Version: "2.0.0"},
-			}
 			// With custom cache key: <cache_key_prefix>/<sourceType>/<source>/<version>
 			cacheKey := "my-prefix/repo/myapp/2.0.0"
-			p.cache.Put(cacheKey, testChart, 1*time.Hour)
+			p.cache.Put(cacheKey, createMinimalChartArchive("custom-cached", "2.0.0"), 1*time.Hour)
 
 			result, err := p.fetchChart(context.Background(),
 				&ChartSourceParams{Source: "myapp", Version: "2.0.0"},
@@ -221,13 +216,10 @@ var _ = Describe("chart_fetch", func() {
 		})
 
 		It("should build correct cache key for OCI sources", func() {
-			testChart := &chart.Chart{
-				Metadata: &chart.Metadata{Name: "oci-chart", Version: "3.0.0"},
-			}
 			// OCI source: oci://ghcr.io/example/chart
 			// After replacing "://" with "-" and "/" with "-": oci-ghcr.io-example-chart
 			cacheKey := "oci/oci-ghcr.io-example-chart/3.0.0"
-			p.cache.Put(cacheKey, testChart, 1*time.Hour)
+			p.cache.Put(cacheKey, createMinimalChartArchive("oci-chart", "3.0.0"), 1*time.Hour)
 
 			result, err := p.fetchChart(context.Background(),
 				&ChartSourceParams{Source: "oci://ghcr.io/example/chart", Version: "3.0.0"},
@@ -237,13 +229,10 @@ var _ = Describe("chart_fetch", func() {
 		})
 
 		It("should build correct cache key for URL sources", func() {
-			testChart := &chart.Chart{
-				Metadata: &chart.Metadata{Name: "url-chart", Version: "1.0.0"},
-			}
 			// URL source: https://example.com/chart.tgz
 			// After replacing "://" with "-" and "/" with "-": https-example.com-chart.tgz
 			cacheKey := "url/https-example.com-chart.tgz/1.0.0"
-			p.cache.Put(cacheKey, testChart, 1*time.Hour)
+			p.cache.Put(cacheKey, createMinimalChartArchive("url-chart", "1.0.0"), 1*time.Hour)
 
 			result, err := p.fetchChart(context.Background(),
 				&ChartSourceParams{Source: "https://example.com/chart.tgz", Version: "1.0.0"},
@@ -286,8 +275,10 @@ entries:
 			}, "", "")
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(ch).ToNot(BeNil())
-			Expect(ch.Metadata.Name).To(Equal("test-repo-chart"))
-			Expect(ch.Metadata.Version).To(Equal("1.0.0"))
+			loaded, err := loader.LoadArchive(bytes.NewReader(ch))
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(loaded.Metadata.Name).To(Equal("test-repo-chart"))
+			Expect(loaded.Metadata.Version).To(Equal("1.0.0"))
 		})
 
 		It("should use first version when no version specified", func() {
@@ -318,7 +309,9 @@ entries:
 				RepoURL: server.URL,
 			}, "", "")
 			Expect(err).ShouldNot(HaveOccurred())
-			Expect(ch.Metadata.Name).To(Equal("no-ver-chart"))
+			loaded, err := loader.LoadArchive(bytes.NewReader(ch))
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(loaded.Metadata.Name).To(Equal("no-ver-chart"))
 		})
 
 		It("should return error when chart not found in index", func() {
@@ -420,8 +413,10 @@ entries:
 			}, "", "")
 			Expect(err).ShouldNot(HaveOccurred())
 			Expect(ch).ToNot(BeNil())
-			Expect(ch.Metadata.Name).To(Equal("url-chart"))
-			Expect(ch.Metadata.Version).To(Equal("2.0.0"))
+			loaded, err := loader.LoadArchive(bytes.NewReader(ch))
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(loaded.Metadata.Name).To(Equal("url-chart"))
+			Expect(loaded.Metadata.Version).To(Equal("2.0.0"))
 		})
 
 		It("should return error for unreachable URL", func() {
@@ -575,6 +570,36 @@ data:
 		Mode: 0644,
 	})
 	_, _ = tarWriter.Write([]byte(tmpl))
+
+	_ = tarWriter.Close()
+	_ = gzWriter.Close()
+
+	return buf.Bytes()
+}
+
+// createChartArchive serializes a *chart.Chart into a .tgz archive so it can be
+// stored in the byte-based cache and re-loaded by loader.LoadArchive.
+func createChartArchive(ch *chart.Chart) []byte {
+	var buf bytes.Buffer
+	gzWriter := gzip.NewWriter(&buf)
+	tarWriter := tar.NewWriter(gzWriter)
+
+	chartYaml := fmt.Sprintf("apiVersion: v2\nname: %s\nversion: %s\n", ch.Metadata.Name, ch.Metadata.Version)
+	_ = tarWriter.WriteHeader(&tar.Header{
+		Name: ch.Metadata.Name + "/Chart.yaml",
+		Size: int64(len(chartYaml)),
+		Mode: 0644,
+	})
+	_, _ = tarWriter.Write([]byte(chartYaml))
+
+	for _, f := range ch.Templates {
+		_ = tarWriter.WriteHeader(&tar.Header{
+			Name: ch.Metadata.Name + "/" + f.Name,
+			Size: int64(len(f.Data)),
+			Mode: 0644,
+		})
+		_, _ = tarWriter.Write(f.Data)
+	}
 
 	_ = tarWriter.Close()
 	_ = gzWriter.Close()

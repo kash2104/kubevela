@@ -134,7 +134,16 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 	// Check if caching is disabled
 	if options != nil && options.Cache != nil && options.Cache.TTL == "0" {
 		klog.V(4).Info("Cache disabled for this chart")
-		return p.fetchChartWithoutCache(ctx, params, sourceType, appNamespace, releaseNamespace)
+		chartBytes, err := p.fetchChartWithoutCache(ctx, params, sourceType, appNamespace, releaseNamespace)
+		if err != nil {
+			return nil, err
+		}
+		chart, err := loader.LoadArchive(bytes.NewReader(chartBytes))
+		if err != nil {
+			return nil, errors.Wrap(err, "failed to load chart archive")
+		}
+
+		return chart, nil
 	}
 
 	// Check if we have a cached chart. The auth-bound cache key above is
@@ -144,7 +153,8 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 	// errors the cache-miss path would surface, instead of returning a
 	// confusing cache-hit chart for a misconfigured request.
 	if cached, found := p.cache.Get(cacheKey); found && cached != nil {
-		if ch, ok := cached.(*chart.Chart); ok {
+		HelmChartCacheHitsTotal.Inc()
+		if ch, err := loader.LoadArchive(bytes.NewReader(cached)); err == nil {
 			if params.Auth != nil && params.Auth.SecretRef != nil {
 				if _, _, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceType); err != nil {
 					return nil, err
@@ -152,6 +162,8 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 			}
 			klog.V(3).Infof("Using cached chart with key: %s", cacheKey)
 			return ch, nil
+		} else {
+			return nil, errors.Wrap(err, "failed to load chart archive")
 		}
 	}
 
@@ -171,11 +183,15 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 		klog.V(3).Infof("Cached chart with key: %s (TTL: %v)", cacheKey, cacheTTL)
 	}
 
-	return ch, nil
+	chart, err := loader.LoadArchive(bytes.NewReader(ch))
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to load chart archive")
+	}
+	return chart, nil
 }
 
 // fetchChartWithoutCache fetches a chart without using cache
-func (p *Provider) fetchChartWithoutCache(ctx context.Context, params *ChartSourceParams, sourceType string, appNamespace, releaseNamespace string) (*chart.Chart, error) {
+func (p *Provider) fetchChartWithoutCache(ctx context.Context, params *ChartSourceParams, sourceType string, appNamespace, releaseNamespace string) ([]byte, error) {
 	switch sourceType {
 	case "oci":
 		return p.fetchOCIChart(ctx, params, appNamespace, releaseNamespace)
@@ -235,7 +251,7 @@ func (p *Provider) determineCacheTTL(version string, options *RenderOptionsParam
 }
 
 // fetchOCIChart fetches a chart from an OCI registry.
-func (p *Provider) fetchOCIChart(ctx context.Context, params *ChartSourceParams, appNamespace, releaseNamespace string) (*chart.Chart, error) {
+func (p *Provider) fetchOCIChart(ctx context.Context, params *ChartSourceParams, appNamespace, releaseNamespace string) ([]byte, error) {
 	httpOpts, rawDockerCfg, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceTypeOCI)
 	if err != nil {
 		return nil, errors.Wrap(err, "auth resolution failed")
@@ -268,11 +284,12 @@ func (p *Provider) fetchOCIChart(ctx context.Context, params *ChartSourceParams,
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to pull OCI chart %s", ref)
 	}
-	return loader.LoadArchive(bytes.NewReader(result.Chart.Data))
+	// return loader.LoadArchive(bytes.NewReader(result.Chart.Data))
+	return result.Chart.Data, nil
 }
 
 // fetchURLChart fetches a chart from a direct URL.
-func (p *Provider) fetchURLChart(ctx context.Context, params *ChartSourceParams, appNamespace, releaseNamespace string) (*chart.Chart, error) {
+func (p *Provider) fetchURLChart(ctx context.Context, params *ChartSourceParams, appNamespace, releaseNamespace string) ([]byte, error) {
 	httpOpts, _, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceTypeURL)
 	if err != nil {
 		return nil, errors.Wrap(err, "auth resolution failed")
@@ -285,15 +302,11 @@ func (p *Provider) fetchURLChart(ctx context.Context, params *ChartSourceParams,
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to download chart from %s", params.Source)
 	}
-	ch, err := loader.LoadArchive(bytes.NewReader(chartBytes))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to load chart archive")
-	}
-	return ch, nil
+	return chartBytes, nil
 }
 
 // fetchRepoChart fetches a chart from a Helm repository.
-func (p *Provider) fetchRepoChart(ctx context.Context, params *ChartSourceParams, appNamespace, releaseNamespace string) (*chart.Chart, error) {
+func (p *Provider) fetchRepoChart(ctx context.Context, params *ChartSourceParams, appNamespace, releaseNamespace string) ([]byte, error) {
 	if params.RepoURL == "" {
 		return nil, fmt.Errorf("repoURL is required for repository-based charts")
 	}
@@ -337,9 +350,5 @@ func (p *Provider) fetchRepoChart(ctx context.Context, params *ChartSourceParams
 	if err != nil {
 		return nil, errors.Wrapf(err, "failed to download chart from %s", downloadURL)
 	}
-	ch, err := loader.LoadArchive(bytes.NewReader(chartBytes))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to load chart archive")
-	}
-	return ch, nil
+	return chartBytes, nil
 }
