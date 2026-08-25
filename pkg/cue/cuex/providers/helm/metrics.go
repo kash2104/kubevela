@@ -27,6 +27,12 @@ var HelmChartCacheHitsTotal = prometheus.NewCounter(prometheus.CounterOpts{
 	Help: "Total number of cache hits when fetching helm charts.",
 })
 
+// HelmChartCacheMissTotal counts the number of cache misses when fetching helm charts.
+var HelmChartCacheMissTotal = prometheus.NewCounter(prometheus.CounterOpts{
+	Name: "kubevela_helm_chart_cache_miss_total",
+	Help: "Total number of cache misses when fetching helm charts.",
+})
+
 // HelmChartCacheEvictionsTotal counts cache entries evicted, by reason.
 // Labels:
 //   - reason: "capacity" (LRU eviction when the byte budget is full) or "ttl" (expired entry removed)
@@ -46,6 +52,7 @@ var HelmChartCacheBytes = prometheus.NewGauge(prometheus.GaugeOpts{
 func init() {
 	metrics.Registry.MustRegister(
 		HelmChartCacheHitsTotal,
+		HelmChartCacheMissTotal,
 		HelmChartCacheEvictionsTotal,
 		HelmChartCacheBytes,
 	)

@@ -153,8 +153,8 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 	// errors the cache-miss path would surface, instead of returning a
 	// confusing cache-hit chart for a misconfigured request.
 	if cached, found := p.cache.Get(cacheKey); found && cached != nil {
-		HelmChartCacheHitsTotal.Inc()
 		if ch, err := loader.LoadArchive(bytes.NewReader(cached)); err == nil {
+			HelmChartCacheHitsTotal.Inc()
 			if params.Auth != nil && params.Auth.SecretRef != nil {
 				if _, _, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceType); err != nil {
 					return nil, err
@@ -162,30 +162,32 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 			}
 			klog.V(3).Infof("Using cached chart with key: %s", cacheKey)
 			return ch, nil
-		} else {
-			return nil, errors.Wrap(err, "failed to load chart archive")
 		}
+		klog.V(2).Infof("Cached chart with key %s failed to load, evicting and refetching", cacheKey)
+		p.cache.Delete(cacheKey)
 	}
 
 	klog.V(4).Infof("Cache miss for key: %s, fetching chart", cacheKey)
+	HelmChartCacheMissTotal.Inc()
 
 	ch, err := p.fetchChartWithoutCache(ctx, params, sourceType, appNamespace, releaseNamespace)
 	if err != nil {
 		return nil, err
 	}
 
+	chart, err := loader.LoadArchive(bytes.NewReader(ch))
+	if err != nil {
+		p.cache.Delete(cacheKey)
+		return nil, errors.Wrap(err, "failed to load chart archive")
+	}
 	// Determine cache TTL
 	cacheTTL := p.determineCacheTTL(params.Version, options)
 
 	// Cache the chart with appropriate TTL
 	if cacheTTL > 0 {
 		p.cache.Put(cacheKey, ch, cacheTTL)
+		HelmChartCacheBytes.Set(float64(p.cache.CurrentBytes()))
 		klog.V(3).Infof("Cached chart with key: %s (TTL: %v)", cacheKey, cacheTTL)
-	}
-
-	chart, err := loader.LoadArchive(bytes.NewReader(ch))
-	if err != nil {
-		return nil, errors.Wrap(err, "failed to load chart archive")
 	}
 	return chart, nil
 }

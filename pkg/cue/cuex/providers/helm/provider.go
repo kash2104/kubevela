@@ -29,6 +29,7 @@ import (
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/cli"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/klog/v2"
 )
 
 // dryRunContextKey is used to signal the helm provider that it should perform
@@ -86,7 +87,7 @@ func evictionReasonLabel(reason cache.EvictionReason) string {
 
 // Provider is the Helm chart provider
 type Provider struct {
-	cache               cache.LRUCache[string, []byte]
+	cache               *cache.LRUStore[string, []byte]
 	helmClient          *cli.EnvSettings
 	cacheTTL            *CacheTTLConfig
 	releaseMu           sync.Mutex        // serializes install/upgrade/uninstall calls
@@ -113,24 +114,29 @@ var (
 	providerOnce sync.Once
 )
 
+// chartCacheOptions is the shared configuration for the byte-bounded LRU
+// chart cache used by every provider constructor.
+var chartCacheOptions = cache.Options[string, []byte]{
+	MaxSize:  0,
+	MaxBytes: 256 << 20, // 256 MB
+	SizeOf: func(key string, value []byte) int64 {
+		return int64(len(value))
+	},
+	SweepInterval: time.Second * 3,
+}
+
 // NewProvider creates a new Helm provider (returns singleton)
 func NewProvider() *Provider {
 	providerOnce.Do(func() {
-		lruCache, _ := cache.NewLRUStore[string, []byte](context.Background(), cache.Options[string, []byte]{
-			MaxSize:  0,
-			MaxBytes: 256 << 20, // 256 MB
-			SizeOf: func(key string, value []byte) int64 {
-				return int64(len(value))
-			},
-
-			SweepInterval: time.Second * 3,
-		})
+		lruCache, err := cache.NewLRUStore[string, []byte](context.Background(), chartCacheOptions)
+		if err != nil {
+			klog.Fatalf("Failed to create chart LRU cache: %v", err)
+		}
 		lruCache.OnEvict = func(key string, value []byte, reason cache.EvictionReason) {
 			HelmChartCacheEvictionsTotal.WithLabelValues(evictionReasonLabel(reason)).Inc()
 			HelmChartCacheBytes.Set(float64(lruCache.CurrentBytes()))
 		}
 		globalProvider = &Provider{
-
 			cache:               lruCache,
 			helmClient:          cli.New(),
 			cacheTTL:            DefaultCacheTTLConfig(),
@@ -149,14 +155,10 @@ func NewProviderWithConfig(ttlConfig *CacheTTLConfig) *Provider {
 	if ttlConfig == nil {
 		ttlConfig = DefaultCacheTTLConfig()
 	}
-	lruCache, _ := cache.NewLRUStore[string, []byte](context.Background(), cache.Options[string, []byte]{
-		MaxSize:  0,
-		MaxBytes: 256 << 20, // 256 MB
-		SizeOf: func(key string, value []byte) int64 {
-			return int64(len(value))
-		},
-		SweepInterval: time.Second * 3,
-	})
+	lruCache, err := cache.NewLRUStore[string, []byte](context.Background(), chartCacheOptions)
+	if err != nil {
+		klog.Fatalf("Failed to create chart LRU cache: %v", err)
+	}
 	lruCache.OnEvict = func(key string, value []byte, reason cache.EvictionReason) {
 		HelmChartCacheEvictionsTotal.WithLabelValues(evictionReasonLabel(reason)).Inc()
 		HelmChartCacheBytes.Set(float64(lruCache.CurrentBytes()))

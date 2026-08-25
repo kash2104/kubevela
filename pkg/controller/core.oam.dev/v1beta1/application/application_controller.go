@@ -46,6 +46,8 @@ import (
 	wfContext "github.com/kubevela/workflow/pkg/context"
 	"github.com/kubevela/workflow/pkg/executor"
 	wffeatures "github.com/kubevela/workflow/pkg/features"
+	wfhttp "github.com/kubevela/workflow/pkg/providers/http"
+	wflegacyhttp "github.com/kubevela/workflow/pkg/providers/legacy/http"
 
 	ctrlrec "github.com/kubevela/pkg/controller/reconciler"
 
@@ -768,6 +770,8 @@ type stepStatusCacheInitializer struct{}
 
 func (r *stepStatusCacheInitializer) Start(ctx context.Context) error {
 	executor.InitStepStatusCache(ctx)
+	wfhttp.InitRateLimiter(ctx)
+	wflegacyhttp.InitRateLimiter(ctx)
 	return nil
 }
 
