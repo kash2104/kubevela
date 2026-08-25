@@ -26,6 +26,7 @@ import (
 
 	"github.com/kubevela/pkg/cache"
 	"github.com/pkg/errors"
+	"golang.org/x/sync/singleflight"
 	"helm.sh/helm/v3/pkg/action"
 	"helm.sh/helm/v3/pkg/cli"
 	"k8s.io/client-go/kubernetes"
@@ -88,6 +89,7 @@ func evictionReasonLabel(reason cache.EvictionReason) string {
 // Provider is the Helm chart provider
 type Provider struct {
 	cache               *cache.LRUStore[string, []byte]
+	chartFlight         singleflight.Group
 	helmClient          *cli.EnvSettings
 	cacheTTL            *CacheTTLConfig
 	releaseMu           sync.Mutex        // serializes install/upgrade/uninstall calls

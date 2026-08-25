@@ -145,51 +145,61 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 
 		return chart, nil
 	}
+	v, err, _ := p.chartFlight.Do(cacheKey, func() (interface{}, error) {
 
-	// Check if we have a cached chart. The auth-bound cache key above is
-	// the primary guard against stale credentials. The explicit resolver
-	// re-check below remains as a belt-and-suspenders measure: it catches
-	// a missing or malformed Secret immediately, with the same RFC-cited
-	// errors the cache-miss path would surface, instead of returning a
-	// confusing cache-hit chart for a misconfigured request.
-	if cached, found := p.cache.Get(cacheKey); found && cached != nil {
-		if ch, err := loader.LoadArchive(bytes.NewReader(cached)); err == nil {
-			HelmChartCacheHitsTotal.Inc()
-			if params.Auth != nil && params.Auth.SecretRef != nil {
-				if _, _, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceType); err != nil {
-					return nil, err
+		// Check if we have a cached chart. The auth-bound cache key above is
+		// the primary guard against stale credentials. The explicit resolver
+		// re-check below remains as a belt-and-suspenders measure: it catches
+		// a missing or malformed Secret immediately, with the same RFC-cited
+		// errors the cache-miss path would surface, instead of returning a
+		// confusing cache-hit chart for a misconfigured request.
+		if cached, found := p.cache.Get(cacheKey); found && cached != nil {
+			if ch, err := loader.LoadArchive(bytes.NewReader(cached)); err == nil {
+				HelmChartCacheHitsTotal.Inc()
+				if params.Auth != nil && params.Auth.SecretRef != nil {
+					if _, _, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceType); err != nil {
+						return nil, err
+					}
 				}
+				klog.V(3).Infof("Using cached chart with key: %s", cacheKey)
+				return ch, nil
 			}
-			klog.V(3).Infof("Using cached chart with key: %s", cacheKey)
-			return ch, nil
+			klog.V(2).Infof("Cached chart with key %s failed to load, evicting and refetching", cacheKey)
+			p.cache.Delete(cacheKey)
 		}
-		klog.V(2).Infof("Cached chart with key %s failed to load, evicting and refetching", cacheKey)
-		p.cache.Delete(cacheKey)
-	}
 
-	klog.V(4).Infof("Cache miss for key: %s, fetching chart", cacheKey)
-	HelmChartCacheMissTotal.Inc()
+		klog.V(4).Infof("Cache miss for key: %s, fetching chart", cacheKey)
+		HelmChartCacheMissTotal.Inc()
 
-	ch, err := p.fetchChartWithoutCache(ctx, params, sourceType, appNamespace, releaseNamespace)
+		ch, err := p.fetchChartWithoutCache(ctx, params, sourceType, appNamespace, releaseNamespace)
+		if err != nil {
+			return nil, err
+		}
+
+		chart, err := loader.LoadArchive(bytes.NewReader(ch))
+		if err != nil {
+			p.cache.Delete(cacheKey)
+			return nil, errors.Wrap(err, "failed to load chart archive")
+		}
+		// Determine cache TTL
+		cacheTTL := p.determineCacheTTL(params.Version, options)
+
+		// Cache the chart with appropriate TTL
+		if cacheTTL > 0 {
+			p.cache.Put(cacheKey, ch, cacheTTL)
+			HelmChartCacheBytes.Set(float64(p.cache.CurrentBytes()))
+			klog.V(3).Infof("Cached chart with key: %s (TTL: %v)", cacheKey, cacheTTL)
+		}
+		return chart, nil
+	})
 	if err != nil {
 		return nil, err
 	}
-
-	chart, err := loader.LoadArchive(bytes.NewReader(ch))
-	if err != nil {
-		p.cache.Delete(cacheKey)
-		return nil, errors.Wrap(err, "failed to load chart archive")
+	ch, ok := v.(*chart.Chart)
+	if !ok {
+		return nil, fmt.Errorf("unexpected type in cache for key %s: %T", cacheKey, v)
 	}
-	// Determine cache TTL
-	cacheTTL := p.determineCacheTTL(params.Version, options)
-
-	// Cache the chart with appropriate TTL
-	if cacheTTL > 0 {
-		p.cache.Put(cacheKey, ch, cacheTTL)
-		HelmChartCacheBytes.Set(float64(p.cache.CurrentBytes()))
-		klog.V(3).Infof("Cached chart with key: %s (TTL: %v)", cacheKey, cacheTTL)
-	}
-	return chart, nil
+	return ch, nil
 }
 
 // fetchChartWithoutCache fetches a chart without using cache
