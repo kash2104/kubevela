@@ -73,8 +73,10 @@ template: {
 		}]
 		// +usage=The rate limiter of the request
 		ratelimiter?: {
-			limit:  int
-			period: string
+			// +usage=The maximum number of requests allowed within the period. Must be greater than 0.
+			limit: int & >0
+			// +usage=The time window for rate limiting (Go duration string, e.g. "1s", "100ms"). 
+			period: string & =~"^(0|(([0-9]+(\\.[0-9]*)?|\\.[0-9]+)(ns|us|µs|μs|ms|s|m|h))+)$"
 		}
 	}
 }
