@@ -33,6 +33,9 @@ template: {
 				if parameter.headersFromSecret != _|_ {
 					headersFromSecret: parameter.headersFromSecret
 				}
+				if parameter.ratelimiter != _|_ {
+					ratelimiter: parameter.ratelimiter
+				}
 			}
 		}
 	}
@@ -68,5 +71,10 @@ template: {
 			// +usage=The key within Secret.Data whose value becomes the header value
 			key: string
 		}]
+		// +usage=The rate limiter of the request
+		ratelimiter?: {
+			limit:  int
+			period: string
+		}
 	}
 }
