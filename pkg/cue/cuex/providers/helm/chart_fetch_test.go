@@ -50,6 +50,8 @@ var _ = Describe("chart_fetch", func() {
 			Entry("Direct URL with .tgz", "https://github.com/nginx/nginx-helm/releases/download/nginx-1.1.0/nginx-1.1.0.tgz", "url"),
 			Entry("Direct URL with .tar.gz", "https://example.com/charts/app-1.0.0.tar.gz", "url"),
 			Entry("HTTP URL", "http://charts.example.com/app-1.0.0.tgz", "url"),
+			Entry("HTTPS URL without archive suffix", "https://charts.example.com/mychart", "url"),
+			Entry("HTTP URL without archive suffix", "http://charts.example.com/mychart", "url"),
 			Entry("Repository chart", "postgresql", "repo"),
 			Entry("Repository chart with path", "stable/postgresql", "repo"),
 		)
@@ -537,6 +539,259 @@ entries:
 			}, nil, "ns-app", "ns-rel")
 			Expect(err).To(HaveOccurred())
 			Expect(err.Error()).To(ContainSubstring("missing-secret"))
+		})
+	})
+
+	Describe("fetchChart supplementary paths", func() {
+		It("should return the chart when caching is disabled (TTL=0) and the fetch succeeds", func() {
+			chartArchive := createMinimalChartArchive("no-cache-ok", "1.0.0")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/index.yaml":
+					_, _ = w.Write([]byte(`apiVersion: v1
+entries:
+  no-cache-ok:
+    - name: no-cache-ok
+      version: 1.0.0
+      urls:
+        - no-cache-ok-1.0.0.tgz
+`))
+				case "/no-cache-ok-1.0.0.tgz":
+					_, _ = w.Write(chartArchive)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			p := NewProviderWithConfig(nil)
+			ch, err := p.fetchChart(context.Background(), &ChartSourceParams{
+				Source:  "no-cache-ok",
+				RepoURL: server.URL,
+				Version: "1.0.0",
+			}, &RenderOptionsParams{Cache: &CacheParams{TTL: "0"}}, "", "")
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(ch.Metadata.Name).To(Equal("no-cache-ok"))
+		})
+
+		It("should return an error when caching is disabled and the fetched bytes are not a chart", func() {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte("this is not a chart archive"))
+			}))
+			defer server.Close()
+
+			p := NewProviderWithConfig(nil)
+			_, err := p.fetchChart(context.Background(), &ChartSourceParams{
+				Source: server.URL + "/bad.tgz",
+			}, &RenderOptionsParams{Cache: &CacheParams{TTL: "0"}}, "", "")
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to load chart archive"))
+		})
+
+		It("should build an auth-tagged cache key and hit it when auth resolves", func() {
+			scheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "creds", Namespace: "rel-ns"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"username": []byte("u"), "password": []byte("p")},
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+			origKube := singleton.KubeClient.Get()
+			singleton.KubeClient.Set(c)
+			defer singleton.KubeClient.Set(origKube)
+
+			// Pre-warm the cache with the auth-tagged key computed from the
+			// resolved Secret so the request is served entirely from cache.
+			p := NewProviderWithConfig(nil)
+			params := &ChartSourceParams{
+				Source:  "nginx",
+				Version: "1.0.0",
+				Auth:    &AuthParams{SecretRef: &SecretRefParams{Name: "creds"}},
+			}
+			tag, err := computeAuthCacheTag(context.Background(), params, "app-ns", "rel-ns")
+			Expect(err).ShouldNot(HaveOccurred())
+			cacheKey := "repo/nginx/1.0.0/auth-" + tag
+			p.cache.Put(cacheKey, createMinimalChartArchive("auth-ok", "1.0.0"), time.Hour)
+
+			ch, err := p.fetchChart(context.Background(), params, nil, "app-ns", "rel-ns")
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(ch.Metadata.Name).To(Equal("auth-ok"))
+		})
+
+		It("should serve a cache hit when auth resolves successfully on a cached chart", func() {
+			scheme := runtime.NewScheme()
+			Expect(corev1.AddToScheme(scheme)).To(Succeed())
+			secret := &corev1.Secret{
+				ObjectMeta: metav1.ObjectMeta{Name: "hit-creds", Namespace: "rel-ns"},
+				Type:       corev1.SecretTypeOpaque,
+				Data:       map[string][]byte{"username": []byte("u"), "password": []byte("p")},
+			}
+			c := fake.NewClientBuilder().WithScheme(scheme).WithObjects(secret).Build()
+			origKube := singleton.KubeClient.Get()
+			singleton.KubeClient.Set(c)
+			defer singleton.KubeClient.Set(origKube)
+
+			p := NewProviderWithConfig(nil)
+			params := &ChartSourceParams{
+				Source:  "hit-chart",
+				Version: "1.0.0",
+				Auth:    &AuthParams{SecretRef: &SecretRefParams{Name: "hit-creds"}},
+			}
+			tag, err := computeAuthCacheTag(context.Background(), params, "app-ns", "rel-ns")
+			Expect(err).ShouldNot(HaveOccurred())
+			cacheKey := "repo/hit-chart/1.0.0/auth-" + tag
+			p.cache.Put(cacheKey, createMinimalChartArchive("hit-chart", "1.0.0"), time.Hour)
+
+			ch, err := p.fetchChart(context.Background(), params, nil, "app-ns", "rel-ns")
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(ch.Metadata.Name).To(Equal("hit-chart"))
+		})
+
+		It("should evict and refetch when cached bytes fail to load", func() {
+			chartArchive := createMinimalChartArchive("bad-cache", "1.0.0")
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/index.yaml":
+					_, _ = w.Write([]byte(`apiVersion: v1
+entries:
+  bad-cache:
+    - name: bad-cache
+      version: 1.0.0
+      urls:
+        - bad-cache-1.0.0.tgz
+`))
+				case "/bad-cache-1.0.0.tgz":
+					_, _ = w.Write(chartArchive)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			p := NewProviderWithConfig(nil)
+			// Seed the cache with corrupt bytes so the cached-archive load fails,
+			// triggering eviction and a fresh fetch.
+			p.cache.Put("repo/bad-cache/1.0.0", []byte("not a valid chart"), time.Hour)
+
+			ch, err := p.fetchChart(context.Background(), &ChartSourceParams{
+				Source:  "bad-cache",
+				RepoURL: server.URL,
+				Version: "1.0.0",
+			}, nil, "", "")
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(ch.Metadata.Name).To(Equal("bad-cache"))
+		})
+
+		It("should return an error when fetched bytes cannot be loaded as a chart", func() {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/index.yaml":
+					_, _ = w.Write([]byte(`apiVersion: v1
+entries:
+  corrupt:
+    - name: corrupt
+      version: 1.0.0
+      urls:
+        - corrupt-1.0.0.tgz
+`))
+				case "/corrupt-1.0.0.tgz":
+					_, _ = w.Write([]byte("this is not a chart archive at all"))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			p := NewProviderWithConfig(nil)
+			_, err := p.fetchChart(context.Background(), &ChartSourceParams{
+				Source:  "corrupt",
+				RepoURL: server.URL,
+				Version: "1.0.0",
+			}, nil, "", "")
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to load chart archive"))
+		})
+	})
+
+	Describe("fetchOCIChart", func() {
+		It("should pull a public chart from the OCI registry through fetchChart", func() {
+			p := NewProviderWithConfig(nil)
+			ch, err := p.fetchChart(context.Background(), &ChartSourceParams{
+				Source:  "oci://registry-1.docker.io/bitnamicharts/nginx",
+				Version: "19.0.0",
+			}, nil, "", "")
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(ch).ToNot(BeNil())
+			Expect(ch.Metadata.Name).To(Equal("nginx"))
+		})
+
+		It("should pull a public chart from the OCI registry via fetchOCIChart", func() {
+			p := NewProviderWithConfig(nil)
+			chartBytes, err := p.fetchOCIChart(context.Background(), &ChartSourceParams{
+				Source:  "oci://registry-1.docker.io/bitnamicharts/nginx",
+				Version: "19.0.0",
+			}, "", "")
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(chartBytes).ToNot(BeNil())
+			loaded, err := loader.LoadArchive(bytes.NewReader(chartBytes))
+			Expect(err).ShouldNot(HaveOccurred())
+			Expect(loaded.Metadata.Name).To(Equal("nginx"))
+		})
+
+		It("should return an error when the chart cannot be pulled from the registry", func() {
+			p := NewProviderWithConfig(nil)
+			_, err := p.fetchOCIChart(context.Background(), &ChartSourceParams{
+				Source:  "oci://registry-1.docker.io/bitnamicharts/definitely-not-a-real-chart-xyz",
+				Version: "0.0.1",
+			}, "", "")
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to pull OCI chart"))
+		})
+	})
+
+	Describe("fetchRepoChart server error paths", func() {
+		It("should return an error when the repository index cannot be fetched", func() {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Error(w, "boom", http.StatusInternalServerError)
+			}))
+			defer server.Close()
+
+			p := NewProviderWithConfig(nil)
+			_, err := p.fetchRepoChart(context.Background(), &ChartSourceParams{
+				Source:  "nginx",
+				RepoURL: server.URL,
+			}, "", "")
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to fetch repository index"))
+		})
+
+		It("should return an error when the chart archive download fails", func() {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/index.yaml":
+					_, _ = w.Write([]byte(`apiVersion: v1
+entries:
+  dl-fail:
+    - name: dl-fail
+      version: 1.0.0
+      urls:
+        - dl-fail-1.0.0.tgz
+`))
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer server.Close()
+
+			p := NewProviderWithConfig(nil)
+			_, err := p.fetchRepoChart(context.Background(), &ChartSourceParams{
+				Source:  "dl-fail",
+				RepoURL: server.URL,
+				Version: "1.0.0",
+			}, "", "")
+			Expect(err).Should(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("failed to download chart"))
 		})
 	})
 

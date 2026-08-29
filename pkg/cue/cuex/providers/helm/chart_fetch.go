@@ -94,6 +94,14 @@ func isMutableVersion(version string) bool {
 	return true
 }
 
+// chartFetchResult carries the outcome of a chart fetch back to every caller
+// of the singleflight so hit/miss accounting happens per caller rather than
+// only once per deduplicated key.
+type chartFetchResult struct {
+	chart    *chart.Chart
+	cacheHit bool
+}
+
 // fetchChart fetches a Helm chart from the specified source
 func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, options *RenderOptionsParams, appNamespace, releaseNamespace string) (*chart.Chart, error) {
 	sourceType := detectChartSourceType(params.Source)
@@ -155,21 +163,19 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 		// confusing cache-hit chart for a misconfigured request.
 		if cached, found := p.cache.Get(cacheKey); found && cached != nil {
 			if ch, err := loader.LoadArchive(bytes.NewReader(cached)); err == nil {
-				HelmChartCacheHitsTotal.Inc()
 				if params.Auth != nil && params.Auth.SecretRef != nil {
 					if _, _, err := resolveHTTPOptions(ctx, params, appNamespace, releaseNamespace, sourceType); err != nil {
 						return nil, err
 					}
 				}
 				klog.V(3).Infof("Using cached chart with key: %s", cacheKey)
-				return ch, nil
+				return &chartFetchResult{chart: ch, cacheHit: true}, nil
 			}
 			klog.V(2).Infof("Cached chart with key %s failed to load, evicting and refetching", cacheKey)
 			p.cache.Delete(cacheKey)
 		}
 
 		klog.V(4).Infof("Cache miss for key: %s, fetching chart", cacheKey)
-		HelmChartCacheMissTotal.Inc()
 
 		ch, err := p.fetchChartWithoutCache(ctx, params, sourceType, appNamespace, releaseNamespace)
 		if err != nil {
@@ -190,16 +196,23 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 			HelmChartCacheBytes.Set(float64(p.cache.CurrentBytes()))
 			klog.V(3).Infof("Cached chart with key: %s (TTL: %v)", cacheKey, cacheTTL)
 		}
-		return chart, nil
+		return &chartFetchResult{chart: chart, cacheHit: false}, nil
 	})
 	if err != nil {
 		return nil, err
 	}
-	ch, ok := v.(*chart.Chart)
+	res, ok := v.(*chartFetchResult)
 	if !ok {
 		return nil, fmt.Errorf("unexpected type in cache for key %s: %T", cacheKey, v)
 	}
-	return ch, nil
+
+	// Update metrics based on cache hit or miss
+	if res.cacheHit {
+		HelmChartCacheHitsTotal.Inc()
+	} else {
+		HelmChartCacheMissTotal.Inc()
+	}
+	return res.chart, nil
 }
 
 // fetchChartWithoutCache fetches a chart without using cache

@@ -80,10 +80,20 @@ func DefaultCacheTTLConfig() *CacheTTLConfig {
 // evictionReasonLabel normalizes the cache eviction reason into a stable,
 // lowercase Prometheus label value.
 func evictionReasonLabel(reason cache.EvictionReason) string {
-	if reason == cache.EvictTTL {
+	switch reason {
+	case cache.EvictCapacity:
+		return "capacity"
+	case cache.EvictTTL:
 		return "ttl"
+	case cache.EvictDelete:
+		return "delete"
+	case cache.EvictReplace:
+		return "replace"
+	case cache.EvictPurge:
+		return "purge"
+	default:
+		return "unknown"
 	}
-	return "capacity"
 }
 
 // Provider is the Helm chart provider

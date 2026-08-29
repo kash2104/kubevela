@@ -20,6 +20,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/kubevela/pkg/cache"
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 )
@@ -80,6 +81,42 @@ var _ = Describe("provider", func() {
 
 		It("should have a non-nil provider package", func() {
 			Expect(Package).ToNot(BeNil())
+		})
+	})
+
+	Describe("evictionReasonLabel", func() {
+		DescribeTable("should normalize eviction reasons into stable labels",
+			func(reason cache.EvictionReason, expected string) {
+				Expect(evictionReasonLabel(reason)).To(Equal(expected))
+			},
+			Entry("capacity", cache.EvictCapacity, "capacity"),
+			Entry("ttl", cache.EvictTTL, "ttl"),
+			Entry("delete", cache.EvictDelete, "delete"),
+			Entry("replace", cache.EvictReplace, "replace"),
+			Entry("purge", cache.EvictPurge, "purge"),
+			Entry("unknown", cache.EvictionReason("some-other"), "unknown"),
+		)
+	})
+
+	Describe("cache eviction handler", func() {
+		It("should record evictions triggered by a delete on the singleton provider", func() {
+			p := NewProvider()
+			// Populate the cache then delete it: the package-level OnEvict
+			// closure must fire for the EvictDelete reason without panicking.
+			key := "evict-delete"
+			p.cache.Put(key, []byte("data"), time.Minute)
+			Expect(func() { p.cache.Delete(key) }).ShouldNot(Panic())
+		})
+
+		It("should record evictions triggered by a replace on a config provider", func() {
+			p := NewProviderWithConfig(&CacheTTLConfig{
+				ImmutableVersionTTL: 24 * time.Hour,
+				MutableVersionTTL:   5 * time.Minute,
+			})
+			key := "evict-replace"
+			p.cache.Put(key, []byte("old"), time.Minute)
+			// Overwriting an existing key evicts the previous value (EvictReplace).
+			Expect(func() { p.cache.Put(key, []byte("new"), time.Minute) }).ShouldNot(Panic())
 		})
 	})
 
