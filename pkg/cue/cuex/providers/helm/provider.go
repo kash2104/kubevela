@@ -77,6 +77,21 @@ func DefaultCacheTTLConfig() *CacheTTLConfig {
 	}
 }
 
+// missReasonLabel maps a cache eviction reason to the corresponding
+// miss-reason label. Returns ok=false for eviction reasons that should not
+// be recorded (delete, replace, purge) because they don't represent a
+// cache miss on the next Get.
+func missReasonLabel(reason cache.EvictionReason) (string, bool) {
+	switch reason {
+	case cache.EvictTTL:
+		return missReasonExpired, true
+	case cache.EvictCapacity:
+		return missReasonEvicted, true
+	default:
+		return "", false
+	}
+}
+
 // evictionReasonLabel normalizes the cache eviction reason into a stable,
 // lowercase Prometheus label value.
 func evictionReasonLabel(reason cache.EvictionReason) string {
@@ -98,14 +113,15 @@ func evictionReasonLabel(reason cache.EvictionReason) string {
 
 // Provider is the Helm chart provider
 type Provider struct {
-	cache               *cache.LRUStore[string, []byte]
-	chartFlight         singleflight.Group
-	helmClient          *cli.EnvSettings
-	cacheTTL            *CacheTTLConfig
-	releaseMu           sync.Mutex        // serializes install/upgrade/uninstall calls
-	releaseFingerprints map[string]string // namespace/releaseName → fingerprint (chartVersion|valuesHash)
-	releaseManifests    map[string]string // namespace/releaseName → last successful manifest
-	releaseVersions     map[string]int    // namespace/releaseName → current release version number
+	cache                *cache.LRUStore[string, []byte]
+	chartFlight          singleflight.Group
+	helmClient           *cli.EnvSettings
+	cacheTTL             *CacheTTLConfig
+	cacheRecentEvictions *sync.Map         // cache key → miss-reason label (populated by OnEvict)
+	releaseMu            sync.Mutex        // serializes install/upgrade/uninstall calls
+	releaseFingerprints  map[string]string // namespace/releaseName → fingerprint (chartVersion|valuesHash)
+	releaseManifests     map[string]string // namespace/releaseName → last successful manifest
+	releaseVersions      map[string]int    // namespace/releaseName → current release version number
 	// actionConfigFactory builds a helm action.Configuration for a given
 	// namespace. Defaults to getActionConfig (a real cluster client). Tests
 	// override this to inject a fake KubeClient + memory storage driver so
@@ -140,6 +156,7 @@ var chartCacheOptions = cache.Options[string, []byte]{
 // NewProvider creates a new Helm provider (returns singleton)
 func NewProvider() *Provider {
 	providerOnce.Do(func() {
+		cacheRecentEvictions := &sync.Map{}
 		lruCache, err := cache.NewLRUStore[string, []byte](context.Background(), chartCacheOptions)
 		if err != nil {
 			klog.Fatalf("Failed to create chart LRU cache: %v", err)
@@ -147,14 +164,18 @@ func NewProvider() *Provider {
 		lruCache.OnEvict = func(key string, value []byte, reason cache.EvictionReason) {
 			HelmChartCacheEvictionsTotal.WithLabelValues(evictionReasonLabel(reason)).Inc()
 			HelmChartCacheBytes.Set(float64(lruCache.CurrentBytes()))
+			if mr, ok := missReasonLabel(reason); ok {
+				cacheRecentEvictions.Store(key, mr)
+			}
 		}
 		globalProvider = &Provider{
-			cache:               lruCache,
-			helmClient:          cli.New(),
-			cacheTTL:            DefaultCacheTTLConfig(),
-			releaseFingerprints: make(map[string]string),
-			releaseManifests:    make(map[string]string),
-			releaseVersions:     make(map[string]int),
+			cache:                lruCache,
+			helmClient:           cli.New(),
+			cacheTTL:             DefaultCacheTTLConfig(),
+			cacheRecentEvictions: cacheRecentEvictions,
+			releaseFingerprints:  make(map[string]string),
+			releaseManifests:     make(map[string]string),
+			releaseVersions:      make(map[string]int),
 		}
 		globalProvider.actionConfigFactory = globalProvider.getActionConfig
 		globalProvider.kubeClientFactory = globalProvider.getKubeClientset
@@ -167,6 +188,7 @@ func NewProviderWithConfig(ttlConfig *CacheTTLConfig) *Provider {
 	if ttlConfig == nil {
 		ttlConfig = DefaultCacheTTLConfig()
 	}
+	cacheRecentEvictions := &sync.Map{}
 	lruCache, err := cache.NewLRUStore[string, []byte](context.Background(), chartCacheOptions)
 	if err != nil {
 		klog.Fatalf("Failed to create chart LRU cache: %v", err)
@@ -174,14 +196,18 @@ func NewProviderWithConfig(ttlConfig *CacheTTLConfig) *Provider {
 	lruCache.OnEvict = func(key string, value []byte, reason cache.EvictionReason) {
 		HelmChartCacheEvictionsTotal.WithLabelValues(evictionReasonLabel(reason)).Inc()
 		HelmChartCacheBytes.Set(float64(lruCache.CurrentBytes()))
+		if mr, ok := missReasonLabel(reason); ok {
+			cacheRecentEvictions.Store(key, mr)
+		}
 	}
 	p := &Provider{
-		cache:               lruCache,
-		helmClient:          cli.New(),
-		cacheTTL:            ttlConfig,
-		releaseFingerprints: make(map[string]string),
-		releaseManifests:    make(map[string]string),
-		releaseVersions:     make(map[string]int),
+		cache:                lruCache,
+		helmClient:           cli.New(),
+		cacheTTL:             ttlConfig,
+		cacheRecentEvictions: cacheRecentEvictions,
+		releaseFingerprints:  make(map[string]string),
+		releaseManifests:     make(map[string]string),
+		releaseVersions:      make(map[string]int),
 	}
 	p.actionConfigFactory = p.getActionConfig
 	p.kubeClientFactory = p.getKubeClientset

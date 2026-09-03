@@ -94,12 +94,21 @@ func isMutableVersion(version string) bool {
 	return true
 }
 
+// Miss-reason label values for HelmChartCacheMissesTotal.
+const (
+	missReasonAbsent  string = "absent"  // key not present in cache (first request)
+	missReasonExpired string = "expired" // TTL expired (detected via OnEvict callback)
+	missReasonEvicted string = "evicted" // evicted by LRU capacity pressure
+	missReasonCorrupt string = "corrupt" // entry existed but failed to load as a valid chart archive
+)
+
 // chartFetchResult carries the outcome of a chart fetch back to every caller
 // of the singleflight so hit/miss accounting happens per caller rather than
 // only once per deduplicated key.
 type chartFetchResult struct {
-	chart    *chart.Chart
-	cacheHit bool
+	chart      *chart.Chart
+	cacheHit   bool
+	missReason string // populated only when cacheHit is false
 }
 
 // fetchChart fetches a Helm chart from the specified source
@@ -154,6 +163,7 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 		return chart, nil
 	}
 	v, err, _ := p.chartFlight.Do(cacheKey, func() (interface{}, error) {
+		missReason := missReasonAbsent
 
 		// Check if we have a cached chart. The auth-bound cache key above is
 		// the primary guard against stale credentials. The explicit resolver
@@ -173,6 +183,12 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 			}
 			klog.V(2).Infof("Cached chart with key %s failed to load, evicting and refetching", cacheKey)
 			p.cache.Delete(cacheKey)
+			missReason = missReasonCorrupt
+		} else {
+			// Set reason for cache miss
+			if reason, ok := p.cacheRecentEvictions.LoadAndDelete(cacheKey); ok {
+				missReason = reason.(string)
+			}
 		}
 
 		klog.V(4).Infof("Cache miss for key: %s, fetching chart", cacheKey)
@@ -196,7 +212,7 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 			HelmChartCacheBytes.Set(float64(p.cache.CurrentBytes()))
 			klog.V(3).Infof("Cached chart with key: %s (TTL: %v)", cacheKey, cacheTTL)
 		}
-		return &chartFetchResult{chart: chart, cacheHit: false}, nil
+		return &chartFetchResult{chart: chart, cacheHit: false, missReason: missReason}, nil
 	})
 	if err != nil {
 		return nil, err
@@ -210,7 +226,7 @@ func (p *Provider) fetchChart(ctx context.Context, params *ChartSourceParams, op
 	if res.cacheHit {
 		HelmChartCacheHitsTotal.Inc()
 	} else {
-		HelmChartCacheMissTotal.Inc()
+		HelmChartCacheMissesTotal.WithLabelValues(res.missReason).Inc()
 	}
 	return res.chart, nil
 }
