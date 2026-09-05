@@ -142,22 +142,67 @@ var (
 	providerOnce sync.Once
 )
 
-// chartCacheOptions is the shared configuration for the byte-bounded LRU
+const (
+	// DefaultChartCacheMaxBytes is the default byte budget for the chart
+	// cache. Keep it well below the container memory limit: cached archives
+	// are only part of the footprint, since each render also decompresses a
+	// copy into chart objects.
+	DefaultChartCacheMaxBytes int64 = 256 << 20 // 256 MB
+	// DefaultChartCacheSweepInterval is how often expired entries are removed.
+	// The sweep takes the same lock as Get and Put and scans every key, so
+	// this trades reclaim latency against lock contention.
+	DefaultChartCacheSweepInterval = 60 * time.Second
+)
+
+var (
+	// chartCacheMaxBytes and chartCacheSweepInterval hold the effective cache
+	// tuning. InitChartCache overwrites them from the controller flags before
+	// any provider is constructed.
+	chartCacheMaxBytes      = DefaultChartCacheMaxBytes
+	chartCacheSweepInterval = DefaultChartCacheSweepInterval
+	// chartCacheCtx bounds the lifetime of the singleton cache's sweeper.
+	chartCacheCtx context.Context = context.Background()
+)
+
+// InitChartCache configures the chart cache before the provider singleton is
+// built. ctx SHOULD be the controller's root context so the sweeper goroutine
+// is torn down with the manager. Non-positive values fall back to the defaults,
+// so a partial flag set cannot produce an unbounded or hot-spinning cache.
+func InitChartCache(ctx context.Context, maxBytes int64, sweepInterval time.Duration) {
+	if ctx != nil {
+		chartCacheCtx = ctx
+	}
+	if maxBytes < 0 {
+		klog.Warningf("helm chart cache max bytes %d is invalid (must be >= 0); using default %d", maxBytes, DefaultChartCacheMaxBytes)
+		maxBytes = DefaultChartCacheMaxBytes
+	}
+	if sweepInterval <= 0 {
+		klog.Warningf("helm chart cache sweep interval %v is invalid (must be > 0); using default %v", sweepInterval, DefaultChartCacheSweepInterval)
+		sweepInterval = DefaultChartCacheSweepInterval
+	}
+	chartCacheMaxBytes = maxBytes
+	chartCacheSweepInterval = sweepInterval
+	klog.Infof("Helm chart cache configured: maxBytes=%d sweepInterval=%v", maxBytes, sweepInterval)
+}
+
+// chartCacheOptions returns the shared configuration for the byte-bounded LRU
 // chart cache used by every provider constructor.
-var chartCacheOptions = cache.Options[string, []byte]{
-	MaxSize:  0,
-	MaxBytes: 256 << 20, // 256 MB
-	SizeOf: func(key string, value []byte) int64 {
-		return int64(len(value))
-	},
-	SweepInterval: time.Second * 3,
+func chartCacheOptions() cache.Options[string, []byte] {
+	return cache.Options[string, []byte]{
+		MaxSize:  0,
+		MaxBytes: chartCacheMaxBytes,
+		SizeOf: func(key string, value []byte) int64 {
+			return int64(len(value))
+		},
+		SweepInterval: chartCacheSweepInterval,
+	}
 }
 
 // NewProvider creates a new Helm provider (returns singleton)
 func NewProvider() *Provider {
 	providerOnce.Do(func() {
 		cacheRecentEvictions := &sync.Map{}
-		lruCache, err := cache.NewLRUStore[string, []byte](context.Background(), chartCacheOptions)
+		lruCache, err := cache.NewLRUStore[string, []byte](chartCacheCtx, chartCacheOptions())
 		if err != nil {
 			klog.Fatalf("Failed to create chart LRU cache: %v", err)
 		}
@@ -189,7 +234,7 @@ func NewProviderWithConfig(ttlConfig *CacheTTLConfig) *Provider {
 		ttlConfig = DefaultCacheTTLConfig()
 	}
 	cacheRecentEvictions := &sync.Map{}
-	lruCache, err := cache.NewLRUStore[string, []byte](context.Background(), chartCacheOptions)
+	lruCache, err := cache.NewLRUStore[string, []byte](chartCacheCtx, chartCacheOptions())
 	if err != nil {
 		klog.Fatalf("Failed to create chart LRU cache: %v", err)
 	}

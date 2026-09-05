@@ -57,6 +57,15 @@ workflow:
     errorRetryTimes: 10
 
 
+## @section KubeVela Helm cache parameters
+
+## @param helmCache.maxBytes Maximum number of bytes to keep in the Helm chart cache. Tune this down on memory-constrained deployments (the default 256MiB can be a quarter of a 1Gi container). Set to 0 to use the built-in default.
+## @param helmCache.sweepInterval How often the Helm chart cache sweeps expired entries (e.g. "60s"). The sweep shares the lock with Get and Put, so a very small interval raises lock contention. Set to 0 to use the built-in default.
+helmCache:
+  maxBytes: 268435456
+  sweepInterval: "60s"
+
+
 ## @section KubeVela controller parameters
 
 ## @param replicaCount KubeVela controller replica count
